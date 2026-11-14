@@ -1,4 +1,5 @@
 // VocalChain - cadena vocal todo en uno (VST3)
+// Interfaz: rack de efectos
 // Orden: Gate -> EQ -> Autotune -> De-esser -> Compresor -> Saturacion -> Delay -> Reverb -> Limiter -> Salida
 
 #include <juce_audio_utils/juce_audio_utils.h>
@@ -7,6 +8,321 @@
 #include <limits>
 #include <vector>
 #include <algorithm>
+
+//==============================================================================
+// Interfaz tipo rack de efectos
+class RackLookAndFeel : public juce::LookAndFeel_V4
+{
+public:
+    RackLookAndFeel()
+    {
+        setColour (juce::ComboBox::backgroundColourId, juce::Colour (0xff15171b));
+        setColour (juce::ComboBox::textColourId, juce::Colour (0xffd8dbe0));
+        setColour (juce::ComboBox::outlineColourId, juce::Colour (0xff3a3e46));
+        setColour (juce::ComboBox::arrowColourId, juce::Colour (0xffd8dbe0));
+        setColour (juce::PopupMenu::backgroundColourId, juce::Colour (0xff1a1c20));
+        setColour (juce::PopupMenu::textColourId, juce::Colour (0xffd8dbe0));
+        setColour (juce::PopupMenu::highlightedBackgroundColourId, juce::Colour (0xff3a3e46));
+        setColour (juce::PopupMenu::highlightedTextColourId, juce::Colours::white);
+        setColour (juce::ToggleButton::textColourId, juce::Colour (0xffd8dbe0));
+        setColour (juce::ToggleButton::tickDisabledColourId, juce::Colour (0xff5a5f68));
+    }
+
+    void drawRotarySlider (juce::Graphics& g, int x, int y, int w, int h, float pos,
+                           float startAngle, float endAngle, juce::Slider& s) override
+    {
+        auto bounds = juce::Rectangle<float> ((float) x, (float) y, (float) w, (float) h).reduced (4.0f);
+        const float r = juce::jmin (bounds.getWidth(), bounds.getHeight()) / 2.0f;
+        const float cx = bounds.getCentreX();
+        const float cy = bounds.getCentreY();
+        const auto accent = s.findColour (juce::Slider::rotarySliderFillColourId);
+        const juce::PathStrokeType stroke (4.0f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded);
+
+        juce::Path track;
+        track.addCentredArc (cx, cy, r, r, 0.0f, startAngle, endAngle, true);
+        g.setColour (juce::Colour (0xff2a2d33));
+        g.strokePath (track, stroke);
+
+        const float angle = startAngle + pos * (endAngle - startAngle);
+        juce::Path val;
+        val.addCentredArc (cx, cy, r, r, 0.0f, startAngle, angle, true);
+        g.setColour (accent);
+        g.strokePath (val, stroke);
+
+        const float kr = r - 8.0f;
+        g.setGradientFill (juce::ColourGradient (juce::Colour (0xff50555e), cx, cy - kr,
+                                                 juce::Colour (0xff1c1e22), cx, cy + kr, false));
+        g.fillEllipse (cx - kr, cy - kr, kr * 2.0f, kr * 2.0f);
+        g.setColour (juce::Colours::black.withAlpha (0.6f));
+        g.drawEllipse (cx - kr, cy - kr, kr * 2.0f, kr * 2.0f, 1.5f);
+
+        juce::Path p;
+        p.addRoundedRectangle (-1.5f, -kr + 3.0f, 3.0f, kr * 0.5f, 1.5f);
+        g.setColour (accent);
+        g.fillPath (p, juce::AffineTransform::rotation (angle).translated (cx, cy));
+    }
+};
+
+class VocalChainEditor : public juce::AudioProcessorEditor
+{
+public:
+    VocalChainEditor (juce::AudioProcessor& p, juce::AudioProcessorValueTreeState& s)
+        : juce::AudioProcessorEditor (p), apvts (s)
+    {
+        setLookAndFeel (&laf);
+
+        auto& gate = addModule ("GATE", juce::Colour (0xff3fd0c9));
+        addKnob (gate, "gateThresh", "UMBRAL", " dB", 1);
+
+        auto& eq = addModule ("EQ", juce::Colour (0xfff5a623));
+        addKnob (eq, "hpFreq",   "CORTE GRAVES", " Hz", 0);
+        addKnob (eq, "lmFreq",   "MEDIOS FREC", " Hz", 0);
+        addKnob (eq, "lmGain",   "MEDIOS", " dB", 1);
+        addKnob (eq, "presFreq", "PRESENCIA FREC", " Hz", 0);
+        addKnob (eq, "presGain", "PRESENCIA", " dB", 1);
+        addKnob (eq, "airGain",  "AIRE", " dB", 1);
+
+        auto& at = addModule ("AUTOTUNE", juce::Colour (0xffc86bff));
+        addKnob (at, "atSpeed", "VELOCIDAD", " ms", 0);
+        addKnob (at, "atMix",   "MEZCLA", "", 2);
+
+        atToggle.setButtonText ("ACTIVO");
+        atToggle.setColour (juce::ToggleButton::tickColourId, at.colour);
+        keyBox.addItemList (juce::StringArray { "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B" }, 1);
+        scaleBox.addItemList (juce::StringArray { "Cromatica", "Mayor", "Menor" }, 1);
+        addAndMakeVisible (atToggle);
+        addAndMakeVisible (keyBox);
+        addAndMakeVisible (scaleBox);
+        atAtt    = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (apvts, "atOn", atToggle);
+        keyAtt   = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (apvts, "atKey", keyBox);
+        scaleAtt = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (apvts, "atScale", scaleBox);
+        at.header = { &atToggle, &keyBox, &scaleBox };
+
+        auto& ds = addModule ("DE-ESSER", juce::Colour (0xff4ade80));
+        addKnob (ds, "dsFreq",   "FRECUENCIA", " Hz", 0);
+        addKnob (ds, "dsThresh", "UMBRAL", " dB", 1);
+        addKnob (ds, "dsAmount", "REDUCCION", " dB", 1);
+
+        auto& comp = addModule ("COMPRESOR", juce::Colour (0xffff6b6b));
+        addKnob (comp, "cThresh",  "UMBRAL", " dB", 1);
+        addKnob (comp, "cRatio",   "RATIO", ":1", 1);
+        addKnob (comp, "cAttack",  "ATAQUE", " ms", 1);
+        addKnob (comp, "cRelease", "RELEASE", " ms", 0);
+        addKnob (comp, "cMakeup",  "GANANCIA", " dB", 1);
+
+        auto& sat = addModule ("SATURACION", juce::Colour (0xffffd166));
+        addKnob (sat, "satAmt", "CANTIDAD", "", 2);
+
+        auto& dly = addModule ("DELAY", juce::Colour (0xff5aa9ff));
+        addKnob (dly, "dlyTime", "TIEMPO", " ms", 0);
+        addKnob (dly, "dlyFb",   "FEEDBACK", "", 2);
+        addKnob (dly, "dlyMix",  "MEZCLA", "", 2);
+
+        auto& rev = addModule ("REVERB", juce::Colour (0xff8c8cff));
+        addKnob (rev, "revSize", "TAMANO", "", 2);
+        addKnob (rev, "revDamp", "AMORTIGUACION", "", 2);
+        addKnob (rev, "revMix",  "MEZCLA", "", 2);
+
+        auto& lim = addModule ("LIMITER", juce::Colour (0xffff4d8d));
+        addKnob (lim, "limThresh",  "TECHO", " dB", 1);
+        addKnob (lim, "limRelease", "RELEASE", " ms", 0);
+
+        auto& out = addModule ("SALIDA", juce::Colour (0xffe0e3e8));
+        addKnob (out, "outGain", "VOLUMEN", " dB", 1);
+
+        setSize (980, 680);
+    }
+
+    ~VocalChainEditor() override
+    {
+        setLookAndFeel (nullptr);
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        g.fillAll (juce::Colour (0xff0e0f12));
+
+        auto header = getLocalBounds().removeFromTop (56);
+        g.setGradientFill (juce::ColourGradient (juce::Colour (0xff262930), 0.0f, 0.0f,
+                                                 juce::Colour (0xff15171b), 0.0f, 56.0f, false));
+        g.fillRect (header);
+        g.setColour (juce::Colour (0xff3a3e46));
+        g.fillRect (0, 55, getWidth(), 1);
+
+        g.setColour (juce::Colour (0xffe8eaee));
+        g.setFont (26.0f);
+        g.drawText ("VOCALCHAIN", header.reduced (20, 0), juce::Justification::centredLeft);
+        g.setColour (juce::Colour (0xff7d838d));
+        g.setFont (13.0f);
+        g.drawText ("RACK VOCAL", header.reduced (20, 0), juce::Justification::centredRight);
+
+        for (auto& m : modules)
+        {
+            auto r = m->bounds.toFloat();
+
+            g.setGradientFill (juce::ColourGradient (juce::Colour (0xff272a31), r.getX(), r.getY(),
+                                                     juce::Colour (0xff181a1e), r.getX(), r.getBottom(), false));
+            g.fillRoundedRectangle (r, 8.0f);
+            g.setColour (juce::Colour (0xff3a3e46));
+            g.drawRoundedRectangle (r.reduced (0.5f), 8.0f, 1.0f);
+
+            auto bar = r.reduced (1.0f).removeFromTop (26.0f);
+            g.setColour (m->colour.withAlpha (0.16f));
+            g.fillRect (bar);
+            g.setColour (m->colour);
+            g.fillRect (bar.getX(), bar.getBottom() - 2.0f, bar.getWidth(), 2.0f);
+
+            g.setColour (m->colour.brighter (0.3f));
+            g.setFont (14.0f);
+            g.drawText (m->title, bar.reduced (12.0f, 0.0f).toNearestInt(), juce::Justification::centredLeft);
+
+            // tornillos del rack
+            g.setColour (juce::Colour (0xff0b0c0e));
+            g.fillEllipse (bar.getRight() - 18.0f, bar.getCentreY() - 4.0f, 8.0f, 8.0f);
+            g.setColour (juce::Colour (0xff4a4f58));
+            g.drawLine (bar.getRight() - 16.0f, bar.getCentreY() - 2.0f, bar.getRight() - 12.0f, bar.getCentreY() + 2.0f, 1.0f);
+        }
+    }
+
+    void resized() override
+    {
+        auto area = getLocalBounds().withTrimmedTop (56).reduced (12, 10);
+        const std::vector<std::vector<int>> rows = { { 0, 1, 2 }, { 3, 4, 5 }, { 6, 7, 8, 9 } };
+        const int gap = 10;
+        const int numRows = (int) rows.size();
+        const int rowH = (area.getHeight() - gap * (numRows - 1)) / numRows;
+
+        for (const auto& row : rows)
+        {
+            auto rowArea = area.removeFromTop (rowH);
+            area.removeFromTop (gap);
+
+            int totalCells = 0;
+            for (int idx : row)
+                totalCells += cellsOf (*modules[(size_t) idx]);
+
+            const int availW = rowArea.getWidth() - gap * ((int) row.size() - 1);
+            const int unit = availW / juce::jmax (1, totalCells);
+
+            for (int idx : row)
+            {
+                auto& m = *modules[(size_t) idx];
+                m.bounds = rowArea.removeFromLeft (unit * cellsOf (m));
+                rowArea.removeFromLeft (gap);
+                layoutModule (m);
+            }
+        }
+    }
+
+private:
+    struct Knob
+    {
+        juce::Slider slider;
+        juce::Label label;
+        std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> att;
+    };
+
+    struct Module
+    {
+        juce::String title;
+        juce::Colour colour;
+        std::vector<std::unique_ptr<Knob>> knobs;
+        std::vector<juce::Component*> header;
+        juce::Rectangle<int> bounds;
+    };
+
+    RackLookAndFeel laf;
+    juce::AudioProcessorValueTreeState& apvts;
+    std::vector<std::unique_ptr<Module>> modules;
+
+    juce::ToggleButton atToggle;
+    juce::ComboBox keyBox, scaleBox;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> atAtt;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> keyAtt, scaleAtt;
+
+    Module& addModule (const juce::String& title, juce::Colour colour)
+    {
+        modules.push_back (std::make_unique<Module>());
+        auto& m = *modules.back();
+        m.title = title;
+        m.colour = colour;
+        return m;
+    }
+
+    void addKnob (Module& m, const juce::String& id, const juce::String& text,
+                  const juce::String& suffix, int decimals)
+    {
+        auto k = std::make_unique<Knob>();
+
+        k->slider.setSliderStyle (juce::Slider::RotaryHorizontalVerticalDrag);
+        k->slider.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 76, 16);
+        k->slider.setRotaryParameters (juce::MathConstants<float>::pi * 1.2f,
+                                       juce::MathConstants<float>::pi * 2.8f, true);
+        k->slider.setColour (juce::Slider::rotarySliderFillColourId, m.colour);
+        k->slider.setColour (juce::Slider::textBoxTextColourId, juce::Colour (0xffd8dbe0));
+        k->slider.setColour (juce::Slider::textBoxOutlineColourId, juce::Colours::transparentBlack);
+        k->slider.setColour (juce::Slider::textBoxBackgroundColourId, juce::Colours::transparentBlack);
+
+        k->label.setText (text, juce::dontSendNotification);
+        k->label.setJustificationType (juce::Justification::centred);
+        k->label.setFont (juce::Font (juce::FontOptions (11.0f)));
+        k->label.setColour (juce::Label::textColourId, juce::Colour (0xff9aa0aa));
+
+        addAndMakeVisible (k->slider);
+        addAndMakeVisible (k->label);
+
+        k->att = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (apvts, id, k->slider);
+
+        k->slider.textFromValueFunction = [suffix, decimals] (double v)
+        {
+            return juce::String (v, decimals) + suffix;
+        };
+        k->slider.valueFromTextFunction = [] (const juce::String& t)
+        {
+            return t.getDoubleValue();
+        };
+        k->slider.updateText();
+
+        m.knobs.push_back (std::move (k));
+    }
+
+    static int cellsOf (const Module& m)
+    {
+        int c = (int) m.knobs.size();
+        if (! m.header.empty())
+            c = juce::jmax (c, 3);
+        return juce::jmax (1, c);
+    }
+
+    void layoutModule (Module& m)
+    {
+        auto b = m.bounds.reduced (8, 6);
+        b.removeFromTop (26);
+
+        if (! m.header.empty())
+        {
+            auto strip = b.removeFromTop (30);
+            const int w = strip.getWidth() / (int) m.header.size();
+            for (auto* c : m.header)
+                c->setBounds (strip.removeFromLeft (w).reduced (2, 2));
+            b.removeFromTop (4);
+        }
+
+        const int n = (int) m.knobs.size();
+        if (n == 0)
+            return;
+
+        const int cw = b.getWidth() / n;
+        for (auto& k : m.knobs)
+        {
+            auto cell = b.removeFromLeft (cw);
+            k->label.setBounds (cell.removeFromTop (16));
+            k->slider.setBounds (cell);
+        }
+    }
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (VocalChainEditor)
+};
 
 class VocalChainProcessor : public juce::AudioProcessor
 {
@@ -35,7 +351,7 @@ public:
     bool hasEditor() const override { return true; }
     juce::AudioProcessorEditor* createEditor() override
     {
-        return new juce::GenericAudioProcessorEditor (*this);
+        return new VocalChainEditor (*this, apvts);
     }
 
     bool isBusesLayoutSupported (const BusesLayout& layouts) const override
