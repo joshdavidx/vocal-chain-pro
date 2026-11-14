@@ -1,0 +1,30 @@
+name: Compilar VocalChain (Windows)
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configurar
+        run: cmake -B build
+
+      - name: Compilar
+        run: cmake --build build --config Release --parallel
+
+      - name: Empaquetar
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item -Recurse "build/VocalChain_artefacts/Release/VST3/VocalChain.vst3" "dist/VocalChain.vst3"
+          Copy-Item "installer/Instalar.bat" "dist/Instalar.bat"
+
+      - name: Subir resultado
+        uses: actions/upload-artifact@v4
+        with:
+          name: VocalChain-Windows
+          path: dist
